@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: campussage-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: campussage
+      POSTGRES_USER: campussage
+      POSTGRES_PASSWORD: campussage
+    ports:
+      - "5432:5432"
+    volumes:
+      - campussage_pgdata:/var/lib/postgresql/data
+
+volumes:
+  campussage_pgdata:
