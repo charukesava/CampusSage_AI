@@ -19,9 +19,12 @@ import {
 import { startClassReminderScheduler } from "./lib/classReminders.js";
 import rateLimit from "express-rate-limit";
 import {
+  apiLimiter,
+  aiChatLimiter,
   loginLimiter,
   registrationLimiter,
   passwordChangeLimiter,
+  uploadLimiter,
 } from "./middleware/authRateLimiters.js";
 
 const studentSearchLimiter = rateLimit({
@@ -43,7 +46,10 @@ pg.types.setTypeParser(1082, (value) => value);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const port = Number(process.env.PORT || 4000);
-const jwtSecret = process.env.JWT_SECRET || "dev-only-change-me";
+const jwtSecret = process.env.JWT_SECRET;
+if (!jwtSecret) {
+  throw new Error("JWT_SECRET must be configured before starting the server.");
+}
 const uploadDir = path.resolve(
   __dirname,
   "..",
@@ -57,6 +63,7 @@ app.use(
   cors({ origin: process.env.FRONTEND_ORIGIN || "http://localhost:5173" }),
 );
 app.use(express.json({ limit: "2mb" }));
+app.use("/api", apiLimiter);
 
 const storage = multer.diskStorage({
   destination: (req, _file, cb) => {
@@ -624,6 +631,7 @@ app.get("/api/documents", auth, async (req, res, next) => {
 app.post(
   "/api/documents/upload",
   auth,
+  uploadLimiter,
   upload.array("files", 10),
   async (req, res, next) => {
     try {
@@ -808,6 +816,7 @@ app.delete("/api/timetable/:id", auth, async (req, res, next) => {
 app.post(
   "/api/timetable/import/preview",
   auth,
+  uploadLimiter,
   timetableImportUpload.single("file"),
   async (req, res, next) => {
     try {
@@ -1100,121 +1109,130 @@ app.post("/api/chats", auth, async (req, res, next) => {
     next(e);
   }
 });
-app.post("/api/chats/:id/messages", auth, async (req, res, next) => {
-  try {
-    const chat = await pool.query(
-      "SELECT id FROM chats WHERE id=$1 AND user_id=$2",
-      [req.params.id, req.user.sub],
-    );
-    if (!chat.rowCount)
-      return res.status(404).json({ message: "Chat not found." });
-    const userText = String(req.body.content || "").trim();
-    if (!userText)
-      return res.status(400).json({ message: "Message cannot be empty." });
-    const includeUserMessage = req.body.includeUserMessage !== false;
-
-    const historyResult = await pool.query(
-      "SELECT role, content FROM chat_messages WHERE chat_id=$1 ORDER BY created_at DESC LIMIT 12",
-      [req.params.id],
-    );
-    const history = historyResult.rows.reverse();
-
-    const profileResult = await pool.query(
-      "SELECT semester, subjects FROM profiles WHERE user_id=$1",
-      [req.user.sub],
-    );
-    const profile = profileResult.rows[0] || { semester: "", subjects: [] };
-
-    const userMsg = {
-      id: randomUUID(),
-      role: "user",
-      content: userText,
-      citations: [],
-      createdAt: new Date().toISOString(),
-    };
-    if (includeUserMessage)
-      await pool.query(
-        "INSERT INTO chat_messages(id,chat_id,role,content) VALUES($1,$2,$3,$4)",
-        [userMsg.id, req.params.id, "user", userText],
+app.post(
+  "/api/chats/:id/messages",
+  auth,
+  aiChatLimiter,
+  async (req, res, next) => {
+    try {
+      const chat = await pool.query(
+        "SELECT id FROM chats WHERE id=$1 AND user_id=$2",
+        [req.params.id, req.user.sub],
       );
+      if (!chat.rowCount)
+        return res.status(404).json({ message: "Chat not found." });
+      const userText = String(req.body.content || "").trim();
+      if (!userText)
+        return res.status(400).json({ message: "Message cannot be empty." });
+      if (userText.length > 10_000)
+        return res.status(413).json({
+          message: "Message must be 10,000 characters or fewer.",
+        });
+      const includeUserMessage = req.body.includeUserMessage !== false;
 
-    let assistantContent;
-    let citations = [];
-    if (!isGeminiConfigured()) {
-      assistantContent =
-        "AI answering isn't configured yet. Ask the server admin to set a `GEMINI_API_KEY` in the backend's `.env` file, then try again.";
-    } else {
-      try {
-        const chunks = await retrieveRelevantChunks(
-          pool,
-          req.user.sub,
-          userText,
-          profile,
+      const historyResult = await pool.query(
+        "SELECT role, content FROM chat_messages WHERE chat_id=$1 ORDER BY created_at DESC LIMIT 12",
+        [req.params.id],
+      );
+      const history = historyResult.rows.reverse();
+
+      const profileResult = await pool.query(
+        "SELECT semester, subjects FROM profiles WHERE user_id=$1",
+        [req.user.sub],
+      );
+      const profile = profileResult.rows[0] || { semester: "", subjects: [] };
+
+      const userMsg = {
+        id: randomUUID(),
+        role: "user",
+        content: userText,
+        citations: [],
+        createdAt: new Date().toISOString(),
+      };
+      if (includeUserMessage)
+        await pool.query(
+          "INSERT INTO chat_messages(id,chat_id,role,content) VALUES($1,$2,$3,$4)",
+          [userMsg.id, req.params.id, "user", userText],
         );
-        assistantContent = await generateAnswer(userText, chunks, history);
-        const referencedSources = [
-          ...assistantContent.matchAll(/\[Source\s+(\d+)\]/gi),
-        ]
-          .map((match) => Number(match[1]) - 1)
-          .filter(
-            (index, position, all) =>
-              Number.isInteger(index) &&
-              index >= 0 &&
-              index < chunks.length &&
-              all.indexOf(index) === position,
-          );
 
-        const sourceIndexes = referencedSources.length ? referencedSources : [];
-        const seen = new Set();
-        citations = sourceIndexes
-          .map((index) => chunks[index])
-          .filter((chunk) => {
-            const key = `${chunk.documentId}-${chunk.page}`;
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-          })
-          .map((chunk) => ({
-            documentId: chunk.documentId,
-            label: chunk.label,
-            page: chunk.page || 1,
-          }));
-      } catch (error) {
-        console.error("RAG answer generation failed:", error);
+      let assistantContent;
+      let citations = [];
+      if (!isGeminiConfigured()) {
         assistantContent =
-          "I ran into a problem generating an answer just now. Please try again in a moment.";
-      }
-    }
+          "AI answering isn't configured yet. Ask the server admin to set a `GEMINI_API_KEY` in the backend's `.env` file, then try again.";
+      } else {
+        try {
+          const chunks = await retrieveRelevantChunks(
+            pool,
+            req.user.sub,
+            userText,
+            profile,
+          );
+          assistantContent = await generateAnswer(userText, chunks, history);
+          const referencedSources = [
+            ...assistantContent.matchAll(/\[Source\s+(\d+)\]/gi),
+          ]
+            .map((match) => Number(match[1]) - 1)
+            .filter(
+              (index, position, all) =>
+                Number.isInteger(index) &&
+                index >= 0 &&
+                index < chunks.length &&
+                all.indexOf(index) === position,
+            );
 
-    const assistantMsg = {
-      id: randomUUID(),
-      role: "assistant",
-      content: assistantContent,
-      citations,
-      createdAt: new Date().toISOString(),
-    };
-    await pool.query(
-      "INSERT INTO chat_messages(id,chat_id,role,content,citations) VALUES($1,$2,$3,$4,$5)",
-      [
+          const sourceIndexes = referencedSources.length ? referencedSources : [];
+          const seen = new Set();
+          citations = sourceIndexes
+            .map((index) => chunks[index])
+            .filter((chunk) => {
+              const key = `${chunk.documentId}-${chunk.page}`;
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            })
+            .map((chunk) => ({
+              documentId: chunk.documentId,
+              label: chunk.label,
+              page: chunk.page || 1,
+            }));
+        } catch (error) {
+          console.error("RAG answer generation failed:", error);
+          assistantContent =
+            "I ran into a problem generating an answer just now. Please try again in a moment.";
+        }
+      }
+
+      const assistantMsg = {
+        id: randomUUID(),
+        role: "assistant",
+        content: assistantContent,
+        citations,
+        createdAt: new Date().toISOString(),
+      };
+      await pool.query(
+        "INSERT INTO chat_messages(id,chat_id,role,content,citations) VALUES($1,$2,$3,$4,$5)",
+        [
         assistantMsg.id,
         req.params.id,
         "assistant",
         assistantContent,
         JSON.stringify(citations),
-      ],
-    );
-    await pool.query(
-      "UPDATE chats SET title=CASE WHEN title='New conversation' THEN $2 ELSE title END,updated_at=NOW() WHERE id=$1",
-      [req.params.id, userText.slice(0, 32)],
-    );
-    res.json({
-      userMessage: includeUserMessage ? userMsg : null,
-      assistantMessage: assistantMsg,
-    });
-  } catch (e) {
-    next(e);
-  }
-});
+        ],
+      );
+      await pool.query(
+        "UPDATE chats SET title=CASE WHEN title='New conversation' THEN $2 ELSE title END,updated_at=NOW() WHERE id=$1",
+        [req.params.id, userText.slice(0, 32)],
+      );
+      res.json({
+        userMessage: includeUserMessage ? userMsg : null,
+        assistantMessage: assistantMsg,
+      });
+    } catch (e) {
+      next(e);
+    }
+  },
+);
 
 // ---------- CampusConnect: subjects & messages ----------
 
