@@ -1597,9 +1597,9 @@ app.post("/api/subjects/:id/members", auth, async (req, res, next) => {
 
 app.get(
   "/api/students/search",
+  studentSearchLimiter,
   auth,
   requireTeacher,
-  studentSearchLimiter,
   async (req, res, next) => {
     try {
       const q = String(req.query?.q || "").trim();
