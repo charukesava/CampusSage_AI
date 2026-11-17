@@ -18,6 +18,11 @@ import {
 } from "./lib/gemini.js";
 import { startClassReminderScheduler } from "./lib/classReminders.js";
 import rateLimit from "express-rate-limit";
+import {
+  loginLimiter,
+  registrationLimiter,
+  passwordChangeLimiter,
+} from "./middleware/authRateLimiters.js";
 
 const studentSearchLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -343,7 +348,7 @@ app.get("/api/health", async (_req, res) => {
   }
 });
 
-app.post("/api/auth/register", async (req, res, next) => {
+app.post("/api/auth/register", registrationLimiter, async (req, res, next) => {
   const client = await pool.connect();
   try {
     const { name, email, password } = req.body;
@@ -398,7 +403,7 @@ app.post("/api/auth/register", async (req, res, next) => {
   }
 });
 
-app.post("/api/auth/login", async (req, res, next) => {
+app.post("/api/auth/login", loginLimiter, async (req, res, next) => {
   try {
     const { email, password } = req.body;
     if (!email || !password)
@@ -551,54 +556,59 @@ app.patch("/api/settings", auth, async (req, res, next) => {
   }
 });
 
-app.post("/api/auth/change-password", auth, async (req, res, next) => {
-  try {
-    const currentPassword = String(req.body?.currentPassword || "");
-    const newPassword = String(req.body?.newPassword || "");
+app.post(
+  "/api/auth/change-password",
+  auth,
+  passwordChangeLimiter,
+  async (req, res, next) => {
+    try {
+      const currentPassword = String(req.body?.currentPassword || "");
+      const newPassword = String(req.body?.newPassword || "");
 
-    if (!currentPassword || !newPassword) {
-      return res
-        .status(400)
-        .json({ message: "Current password and new password are required." });
+      if (!currentPassword || !newPassword) {
+        return res
+          .status(400)
+          .json({ message: "Current password and new password are required." });
+      }
+      if (newPassword.length < 8) {
+        return res.status(400).json({
+          message: "New password must contain at least 8 characters.",
+        });
+      }
+      if (currentPassword === newPassword) {
+        return res.status(400).json({
+          message: "New password must be different from your current password.",
+        });
+      }
+
+      const result = await pool.query(
+        "SELECT password_hash FROM users WHERE id=$1",
+        [req.user.sub],
+      );
+      if (!result.rowCount)
+        return res.status(404).json({ message: "User not found." });
+
+      const matches = await bcrypt.compare(
+        currentPassword,
+        result.rows[0].password_hash,
+      );
+      if (!matches)
+        return res
+          .status(401)
+          .json({ message: "Current password is incorrect." });
+
+      const hash = await bcrypt.hash(newPassword, 12);
+      await pool.query("UPDATE users SET password_hash=$2 WHERE id=$1", [
+        req.user.sub,
+        hash,
+      ]);
+
+      res.json({ message: "Password changed successfully." });
+    } catch (error) {
+      next(error);
     }
-    if (newPassword.length < 8) {
-      return res
-        .status(400)
-        .json({ message: "New password must contain at least 8 characters." });
-    }
-    if (currentPassword === newPassword) {
-      return res.status(400).json({
-        message: "New password must be different from your current password.",
-      });
-    }
-
-    const result = await pool.query(
-      "SELECT password_hash FROM users WHERE id=$1",
-      [req.user.sub],
-    );
-    if (!result.rowCount)
-      return res.status(404).json({ message: "User not found." });
-
-    const matches = await bcrypt.compare(
-      currentPassword,
-      result.rows[0].password_hash,
-    );
-    if (!matches)
-      return res
-        .status(401)
-        .json({ message: "Current password is incorrect." });
-
-    const hash = await bcrypt.hash(newPassword, 12);
-    await pool.query("UPDATE users SET password_hash=$2 WHERE id=$1", [
-      req.user.sub,
-      hash,
-    ]);
-
-    res.json({ message: "Password changed successfully." });
-  } catch (error) {
-    next(error);
-  }
-});
+  },
+);
 
 app.get("/api/documents", auth, async (req, res, next) => {
   try {
